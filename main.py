@@ -1,93 +1,93 @@
+# main.py (enhanced version)
 import numpy as np
 import time
 import argparse
 import os
 import sys
-from src.environment import TradingEnvironment
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime
+import tensorflow as tf
 from src.backtest_environment import BacktestTradingEnvironment
 from src.agent import DQNAgent
 
-def train_agent(episodes=100, batch_size=32):
-    # Créer l'environnement et l'agent
-    env = TradingEnvironment()
-    state_size = env.observation_space.shape[0]
-    action_size = env.action_space.n
-    agent = DQNAgent(state_size, action_size)
+# Set up TensorFlow logging
+tf.get_logger().setLevel('ERROR')
 
-    # Entraîner l'agent
-    for e in range(episodes):
-        state = env.reset()
-        state = np.reshape(state, [1, state_size])
-        total_reward = 0
-
-        for time_step in range(500):  # Limiter à 500 étapes par épisode
-            # Choisir une action
-            action = agent.act(state)
-
-            # Exécuter l'action
-            next_state, reward, done, _ = env.step(action)
-            next_state = np.reshape(next_state, [1, state_size])
-
-            # Se souvenir de l'expérience
-            agent.remember(state, action, reward, next_state, done)
-
-            # Mettre à jour l'état
-            state = next_state
-            total_reward += reward
-
-            # Entraîner l'agent
-            if len(agent.memory) > batch_size:
-                agent.replay(batch_size)
-
-            if done:
-                break
-
-        # Mettre à jour le modèle cible
-        if e % 10 == 0:
-            agent.update_target_model()
-
-        print(f"Episode: {e+1}/{episodes}, Reward: {total_reward}, Epsilon: {agent.epsilon:.2f}", flush=True)
-
-        # Sauvegarder le modèle
-        if (e+1) % 10 == 0:
-            os.makedirs("models", exist_ok=True)
-            agent.save(f"models/dqn_agent_ep{e+1}.h5")
-
-    # Fermer l'environnement
-    env.close()
-    return agent
-
-def train_on_historical_data(data_path, episodes=100, batch_size=32):
-    """Entraîner l'agent sur des données historiques"""
+def train_on_historical_data(data_path, episodes=50, batch_size=64,
+                             window_size=20,
+                             commission_fee=0.0001,  # 0.01% commission
+                             slippage_base=0.0001,   # 1 pip base slippage
+                             slippage_vol_impact=0.00005,  # additional slippage based on volume
+                             bid_ask_spread=0.0002,  # 2 pips spread
+                             market_impact_factor=0.0001,  # price impact of large orders
+                             liquidity_limit=0.05,   # max 5% of average volume
+                             latency_ms=(10, 50),    # latency between 10-50ms
+                             use_market_features=True,
+                             early_stopping_patience=10):
+    """Train the agent on historical data with realistic trading parameters"""
     print(f"Starting historical data training on {data_path}", flush=True)
 
     try:
-        # Charger les données
+        # Create timestamp for this training run
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"training_{timestamp}"
+
+        # Create directories for logs and models
+        os.makedirs(f"logs/{run_name}", exist_ok=True)
+        os.makedirs(f"models/{run_name}", exist_ok=True)
+
+        # Load data
         print("Loading data...", flush=True)
-        import pandas as pd
         df = pd.read_csv(data_path)
         print(f"CSV columns: {df.columns.tolist()}", flush=True)
         print(f"First few rows:\n{df.head()}", flush=True)
         print(f"Data shape: {df.shape}", flush=True)
 
-        # Créer l'environnement de backtesting
-        env = BacktestTradingEnvironment(data_path)
+        # Create backtesting environment with realistic parameters
+        env = BacktestTradingEnvironment(
+            data_path,
+            window_size=window_size,
+            commission_fee=commission_fee,
+            slippage_base=slippage_base,
+            slippage_vol_impact=slippage_vol_impact,
+            bid_ask_spread=bid_ask_spread,
+            market_impact_factor=market_impact_factor,
+            liquidity_limit=liquidity_limit,
+            latency_ms=latency_ms
+        )
         print(f"Environment created. Data size: {len(env.data)} bars", flush=True)
 
         state_size = env.observation_space.shape[0]
         action_size = env.action_space.n
         print(f"State size: {state_size}, Action size: {action_size}", flush=True)
 
-        # Créer l'agent
+        # Create agent
         print("Creating agent...", flush=True)
-        agent = DQNAgent(state_size, action_size)
+        agent = DQNAgent(
+            state_size=state_size,
+            action_size=action_size,
+            memory_size=10000,
+            gamma=0.95,
+            epsilon=1.0,
+            epsilon_min=0.01,
+            epsilon_decay=0.995,
+            learning_rate=0.001,
+            batch_size=batch_size,
+            update_target_every=10,
+            use_market_features=use_market_features
+        )
         print("Agent created", flush=True)
 
-        # Métriques pour le suivi
+        # Metrics for tracking
         all_rewards = []
         all_balances = []
+        all_trades = []
+        episode_trades = []
+        best_balance = 0
+        patience_counter = 0
 
-        # Entraîner l'agent
+        # Training loop
         for e in range(episodes):
             print(f"Starting episode {e+1}/{episodes}", flush=True)
 
@@ -95,32 +95,47 @@ def train_on_historical_data(data_path, episodes=100, batch_size=32):
                 state = env.reset()
                 state = np.reshape(state, [1, state_size])
                 total_reward = 0
+                episode_trades = []
 
                 done = False
                 time_step = 0
-                max_steps = 10000  # Limite de sécurité
+                max_steps = len(env.data) - env.window_size - 1  # Maximum possible steps
 
                 print(f"  Initial state shape: {state.shape}", flush=True)
 
                 while not done and time_step < max_steps:
-                    # Choisir une action
+                    # Choose action
                     action = agent.act(state)
 
-                    if time_step % 1000 == 0:  # Log tous les 1000 pas
+                    if time_step % 1000 == 0:  # Log every 1000 steps
                         print(f"  Step {time_step}, Action: {action}, Balance: {env.balance:.2f}", flush=True)
 
-                    # Exécuter l'action
+                    # Execute action
                     next_state, reward, done, info = env.step(action)
                     next_state = np.reshape(next_state, [1, state_size])
 
-                    # Se souvenir de l'expérience
+                    # Record trade if position changed
+                    if info.get('position', 0) != 0 and action > 0:
+                        trade_info = {
+                            'step': time_step,
+                            'action': 'buy' if action == 1 else 'sell',
+                            'price': info.get('position_price', 0),
+                            'balance': info.get('balance', 0),
+                            'reward': reward,
+                            'slippage': info.get('slippage', 0),
+                            'spread': info.get('spread', 0)
+                        }
+                        episode_trades.append(trade_info)
+                        all_trades.append(trade_info)
+
+                    # Store experience
                     agent.remember(state, action, reward, next_state, done)
 
-                    # Mettre à jour l'état
+                    # Update state
                     state = next_state
                     total_reward += reward
 
-                    # Entraîner l'agent
+                    # Train agent
                     if len(agent.memory) > batch_size:
                         agent.replay(batch_size)
 
@@ -131,101 +146,202 @@ def train_on_historical_data(data_path, episodes=100, batch_size=32):
 
                 print(f"Episode {e+1} completed after {time_step} steps", flush=True)
 
-                # Mettre à jour le modèle cible
-                if e % 10 == 0:
-                    agent.update_target_model()
-
-                # Enregistrer les métriques
+                # Record metrics
                 all_rewards.append(total_reward)
                 all_balances.append(info['balance'])
 
-                print(f"Episode: {e+1}/{episodes}, Reward: {total_reward:.2f}, Final Balance: {info['balance']:.2f}, Epsilon: {agent.epsilon:.2f}", flush=True)
+                # Early stopping check
+                if info['balance'] > best_balance:
+                    best_balance = info['balance']
+                    patience_counter = 0
+                    # Save best model
+                    agent.save(f"models/{run_name}/dqn_agent_best.h5")
+                else:
+                    patience_counter += 1
 
-                # Sauvegarder le modèle
-                if (e+1) % 10 == 0:
-                    os.makedirs("models", exist_ok=True)
-                    agent.save(f"models/dqn_agent_backtest_ep{e+1}.h5")
+                # Print episode summary
+                print(f"Episode: {e+1}/{episodes}", flush=True)
+                print(f"  Reward: {total_reward:.2f}", flush=True)
+                print(f"  Final Balance: {info['balance']:.2f}", flush=True)
+                print(f"  Epsilon: {agent.epsilon:.4f}", flush=True)
+                print(f"  Trades: {len(episode_trades)}", flush=True)
+
+                # Get agent metrics
+                metrics = agent.get_metrics()
+                print(f"  Avg Loss: {metrics['avg_loss']:.6f}", flush=True)
+                print(f"  Avg Q-Value: {metrics['avg_q_value']:.4f}", flush=True)
+                print(f"  Memory Size: {metrics['memory_size']}", flush=True)
+
+                # Save model periodically
+                if (e+1) % 10 == 0 or e == episodes - 1:
+                    agent.save(f"models/{run_name}/dqn_agent_ep{e+1}.h5")
                     print(f"Model saved at episode {e+1}", flush=True)
 
-            except Exception as e:
-                print(f"Error during episode {e+1}: {e}", flush=True)
+                    # Save training progress
+                    progress_data = {
+                        'episode': list(range(1, e+2)),
+                        'reward': all_rewards,
+                        'balance': all_balances
+                    }
+                    pd.DataFrame(progress_data).to_csv(f"logs/{run_name}/training_progress.csv", index=False)
+
+                # Check for early stopping
+                if patience_counter >= early_stopping_patience:
+                    print(f"Early stopping triggered after {e+1} episodes (no improvement for {early_stopping_patience} episodes)", flush=True)
+                    break
+
+            except Exception as exc:
+                print(f"Error during episode {e+1}: {exc}", flush=True)
                 import traceback
                 traceback.print_exc()
                 continue
 
-        # Visualiser les résultats
+        # Visualize results
         try:
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(12, 8))
+            plt.figure(figsize=(15, 12))
 
-            plt.subplot(2, 1, 1)
+            plt.subplot(3, 1, 1)
             plt.plot(all_rewards)
             plt.title('Rewards per Episode')
+            plt.grid(True)
 
-            plt.subplot(2, 1, 2)
+            plt.subplot(3, 1, 2)
             plt.plot(all_balances)
             plt.title('Final Balance per Episode')
+            plt.grid(True)
+
+            # Plot agent metrics
+            plt.subplot(3, 1, 3)
+            plt.plot(agent.train_loss_history, label='Loss')
+            plt.plot(agent.q_value_history, label='Q-Value')
+            plt.title('Agent Metrics')
+            plt.legend()
+            plt.grid(True)
 
             plt.tight_layout()
-            os.makedirs("logs", exist_ok=True)
-            plt.savefig("logs/backtest_training_results.png")
-            print("Results visualization saved to logs/backtest_training_results.png", flush=True)
-            plt.show()
-        except ImportError:
-            print("Matplotlib not available for visualization", flush=True)
+            plt.savefig(f"logs/{run_name}/training_results.png")
+            print(f"Results visualization saved to logs/{run_name}/training_results.png", flush=True)
 
-        return agent
+            # Save trade history
+            trade_df = pd.DataFrame(all_trades)
+            if not trade_df.empty:
+                trade_df.to_csv(f"logs/{run_name}/trade_history.csv", index=False)
+
+                # Plot trade distribution
+                plt.figure(figsize=(12, 6))
+                plt.hist(trade_df['reward'], bins=50)
+                plt.title('Trade Reward Distribution')
+                plt.grid(True)
+                plt.savefig(f"logs/{run_name}/trade_distribution.png")
+
+        except Exception as e:
+            print(f"Error during visualization: {e}", flush=True)
+
+        return agent, run_name
 
     except Exception as e:
         print(f"Critical error in training: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        return None
+        return None, None
 
-def evaluate_model(model_path, data_path):
-    """Évaluer un modèle entraîné sur des données historiques"""
+def evaluate_model(model_path, data_path,
+                  window_size=20,
+                  commission_fee=0.0001,
+                  slippage_base=0.0001,
+                  slippage_vol_impact=0.00005,
+                  bid_ask_spread=0.0002,
+                  market_impact_factor=0.0001,
+                  liquidity_limit=0.05,
+                  latency_ms=(10, 50),
+                  use_market_features=True):
+    """Evaluate a trained model on historical data with realistic parameters"""
     print(f"Evaluating model {model_path} on {data_path}", flush=True)
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    eval_name = f"evaluation_{timestamp}"
+    os.makedirs(f"logs/{eval_name}", exist_ok=True)
+
     try:
-        # Créer l'environnement de backtesting
-        env = BacktestTradingEnvironment(data_path)
+        # Create backtesting environment with realistic parameters
+        env = BacktestTradingEnvironment(
+            data_path,
+            window_size=window_size,
+            commission_fee=commission_fee,
+            slippage_base=slippage_base,
+            slippage_vol_impact=slippage_vol_impact,
+            bid_ask_spread=bid_ask_spread,
+            market_impact_factor=market_impact_factor,
+            liquidity_limit=liquidity_limit,
+            latency_ms=latency_ms
+        )
         print(f"Evaluation environment created. Data size: {len(env.data)} bars", flush=True)
 
         state_size = env.observation_space.shape[0]
         action_size = env.action_space.n
 
-        # Créer et charger l'agent
-        agent = DQNAgent(state_size, action_size)
+        # Create and load agent
+        agent = DQNAgent(
+            state_size=state_size,
+            action_size=action_size,
+            use_market_features=use_market_features
+        )
         agent.load(model_path)
-        agent.epsilon = 0.0  # Pas d'exploration pendant l'évaluation
-        print("Agent loaded with epsilon=0.0", flush=True)
+        agent.epsilon = 0.01  # Small exploration for robustness
+        print("Agent loaded with epsilon=0.01", flush=True)
 
-        # Métriques pour le suivi
+        # Metrics for tracking
         actions_taken = []
         equity_curve = []
+        trade_history = []
+        position_durations = []
+        current_position_start = None
 
-        # Évaluer l'agent
+        # Evaluate agent
         state = env.reset()
         state = np.reshape(state, [1, state_size])
         print("Starting evaluation...", flush=True)
 
         done = False
         time_step = 0
-        max_steps = 20000  # Limite de sécurité
+        max_steps = len(env.data) - env.window_size - 1
 
         while not done and time_step < max_steps:
-            # Choisir une action
-            action = agent.act(state)
+            # Choose action
+            action = agent.act(state, evaluation=True)
             actions_taken.append(action)
 
-            if time_step % 1000 == 0:  # Log tous les 1000 pas
+            if time_step % 1000 == 0:  # Log every 1000 steps
                 print(f"  Step {time_step}, Action: {action}, Balance: {env.balance:.2f}", flush=True)
 
-            # Exécuter l'action
+            # Execute action
             next_state, reward, done, info = env.step(action)
             next_state = np.reshape(next_state, [1, state_size])
 
-            # Mettre à jour l'état
+            # Track position duration
+            if info['position'] != 0 and current_position_start is None:
+                current_position_start = time_step
+            elif info['position'] == 0 and current_position_start is not None:
+                position_durations.append(time_step - current_position_start)
+                current_position_start = None
+
+            # Record trade if position changed
+            if action > 0:  # Buy or sell action
+                trade_info = {
+                    'step': time_step,
+                    'action': 'buy' if action == 1 else 'sell',
+                    'price': info.get('position_price', 0),
+                    'balance': info.get('balance', 0),
+                    'reward': reward,
+                    'pnl': info.get('pnl', 0),
+                    'slippage': info.get('slippage', 0),
+                    'spread': info.get('spread', 0),
+                    'bid': info.get('bid', 0),
+                    'ask': info.get('ask', 0)
+                }
+                trade_history.append(trade_info)
+
+            # Update state
             state = next_state
             equity_curve.append(info['balance'])
 
@@ -236,12 +352,12 @@ def evaluate_model(model_path, data_path):
 
         print(f"Evaluation completed after {time_step} steps", flush=True)
 
-        # Calculer les métriques de performance
+        # Calculate performance metrics
         initial_balance = 10000.0
         final_balance = equity_curve[-1]
         profit_pct = (final_balance / initial_balance - 1) * 100
 
-        # Calculer le drawdown
+        # Calculate drawdown
         peak = initial_balance
         drawdowns = []
         for balance in equity_curve:
@@ -250,184 +366,217 @@ def evaluate_model(model_path, data_path):
             drawdown_pct = (peak - balance) / peak * 100
             drawdowns.append(drawdown_pct)
 
-        max_drawdown = max(drawdowns)
+        max_drawdown = max(drawdowns) if drawdowns else 0
 
-        # Afficher les résultats
+        # Calculate Sharpe ratio (simplified)
+        if len(equity_curve) > 1:
+            daily_returns = np.diff(equity_curve) / equity_curve[:-1]
+            sharpe_ratio = np.mean(daily_returns) / np.std(daily_returns) if np.std(daily_returns) > 0 else 0
+        else:
+            sharpe_ratio = 0
+
+        # Calculate win rate
+        if trade_history:
+            profitable_trades = sum(1 for trade in trade_history if trade['reward'] > 0)
+            win_rate = profitable_trades / len(trade_history) * 100
+        else:
+            win_rate = 0
+
+        # Display results
         print(f"Evaluation Results:", flush=True)
         print(f"Initial Balance: ${initial_balance:.2f}", flush=True)
         print(f"Final Balance: ${final_balance:.2f}", flush=True)
         print(f"Profit: {profit_pct:.2f}%", flush=True)
         print(f"Max Drawdown: {max_drawdown:.2f}%", flush=True)
+        print(f"Sharpe Ratio: {sharpe_ratio:.4f}", flush=True)
+        print(f"Win Rate: {win_rate:.2f}%", flush=True)
+        print(f"Total Trades: {len(trade_history)}", flush=True)
 
-        # Visualiser les résultats
+        if position_durations:
+            print(f"Avg Position Duration: {np.mean(position_durations):.2f} bars", flush=True)
+
+        # Save results to CSV
+        results = {
+            'metric': ['Initial Balance', 'Final Balance', 'Profit (%)', 'Max Drawdown (%)',
+                      'Sharpe Ratio', 'Win Rate (%)', 'Total Trades', 'Avg Position Duration'],
+            'value': [initial_balance, final_balance, profit_pct, max_drawdown,
+                     sharpe_ratio, win_rate, len(trade_history),
+                     np.mean(position_durations) if position_durations else 0]
+        }
+        pd.DataFrame(results).to_csv(f"logs/{eval_name}/evaluation_results.csv", index=False)
+
+        # Save trade history
+        if trade_history:
+            pd.DataFrame(trade_history).to_csv(f"logs/{eval_name}/trade_history.csv", index=False)
+
+        # Save equity curve
+        equity_df = pd.DataFrame({
+            'step': range(len(equity_curve)),
+            'balance': equity_curve,
+            'drawdown': drawdowns
+        })
+        equity_df.to_csv(f"logs/{eval_name}/equity_curve.csv", index=False)
+
+        # Visualize results
         try:
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(12, 10))
+            plt.figure(figsize=(15, 15))
 
-            plt.subplot(2, 1, 1)
+            plt.subplot(3, 1, 1)
             plt.plot(equity_curve)
             plt.title('Equity Curve')
             plt.axhline(y=initial_balance, color='r', linestyle='-')
+            plt.grid(True)
 
-            plt.subplot(2, 1, 2)
+            plt.subplot(3, 1, 2)
             plt.plot(drawdowns)
             plt.title('Drawdown (%)')
+            plt.grid(True)
+
+            # Plot action distribution
+            plt.subplot(3, 1, 3)
+            action_counts = np.bincount(actions_taken, minlength=3)
+            plt.bar(['Hold', 'Buy', 'Sell'], action_counts)
+            plt.title('Action Distribution')
+            plt.grid(True)
 
             plt.tight_layout()
-            os.makedirs("logs", exist_ok=True)
-            plt.savefig("logs/model_evaluation.png")
-            print("Evaluation visualization saved to logs/model_evaluation.png", flush=True)
-            plt.show()
-        except ImportError:
-            print("Matplotlib not available for visualization", flush=True)
+            plt.savefig(f"logs/{eval_name}/evaluation_results.png")
+            print(f"Evaluation visualization saved to logs/{eval_name}/evaluation_results.png", flush=True)
+
+            # Additional visualizations
+            if trade_history:
+                # Plot trade outcomes
+                plt.figure(figsize=(12, 10))
+
+                plt.subplot(2, 1, 1)
+                trade_rewards = [t['reward'] for t in trade_history]
+                plt.hist(trade_rewards, bins=20)
+                plt.title('Trade Reward Distribution')
+                plt.grid(True)
+
+                plt.subplot(2, 1, 2)
+                trade_steps = [t['step'] for t in trade_history]
+                trade_types = [1 if t['action'] == 'buy' else -1 for t in trade_history]
+                plt.scatter(trade_steps, trade_types, c=[1 if t['reward'] > 0 else 0 for t in trade_history],
+                           cmap='coolwarm', alpha=0.7)
+                plt.title('Trade Timing (Green=Profit, Red=Loss)')
+                plt.yticks([-1, 1], ['Sell', 'Buy'])
+                plt.grid(True)
+
+                plt.tight_layout()
+                plt.savefig(f"logs/{eval_name}/trade_analysis.png")
+
+        except Exception as e:
+            print(f"Error during visualization: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
 
     except Exception as e:
         print(f"Error during evaluation: {e}", flush=True)
         import traceback
         traceback.print_exc()
 
-def live_trading(model_path, duration_hours=24):
-    print(f"Starting live trading with model {model_path} for {duration_hours} hours", flush=True)
-
-    try:
-        # Créer l'environnement
-        env = TradingEnvironment()
-        state_size = env.observation_space.shape[0]
-        action_size = env.action_space.n
-        print("Live trading environment created", flush=True)
-
-        # Créer et charger l'agent
-        agent = DQNAgent(state_size, action_size)
-        agent.load(model_path)
-        agent.epsilon = 0.01  # Très peu d'exploration en trading réel
-        print("Agent loaded with epsilon=0.01", flush=True)
-
-        # Trading en direct
-        state = env.reset()
-        state = np.reshape(state, [1, state_size])
-        total_reward = 0
-        print("Starting live trading...", flush=True)
-
-        start_time = time.time()
-        end_time = start_time + duration_hours * 3600
-
-        trade_count = 0
-
-        while time.time() < end_time:
-            # Choisir une action
-            action = agent.act(state)
-
-            # Exécuter l'action
-            next_state, reward, done, info = env.step(action)
-            next_state = np.reshape(next_state, [1, state_size])
-
-            # Mettre à jour l'état
-            state = next_state
-            total_reward += reward
-            trade_count += 1
-
-            print(f"Trade {trade_count}: Action: {action}, Reward: {reward:.4f}, Total Reward: {total_reward:.4f}", flush=True)
-
-            if 'balance' in info:
-                print(f"Current Balance: ${info['balance']:.2f}", flush=True)
-
-            if done:
-                print("Trading session completed by environment", flush=True)
-                break
-
-            # Attendre avant la prochaine action
-            time.sleep(60)  # Attendre 1 minute
-
-            # Afficher le temps restant toutes les 10 minutes
-            elapsed = time.time() - start_time
-            if trade_count % 10 == 0:
-                remaining = duration_hours * 3600 - elapsed
-                print(f"Time elapsed: {elapsed/3600:.2f} hours, Remaining: {remaining/3600:.2f} hours", flush=True)
-
-        print(f"Live trading completed. Total trades: {trade_count}, Total reward: {total_reward:.4f}", flush=True)
-
-        # Fermer l'environnement
-        env.close()
-
-    except Exception as e:
-        print(f"Error during live trading: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='RL Trading Bot')
+    parser = argparse.ArgumentParser(description='RL Trading Bot with Realistic Parameters')
     parser.add_argument('--mode', type=int, default=0,
-                        help='Mode: 0=menu, 1=live training, 2=historical training, 3=evaluation, 4=live trading')
+                        help='Mode: 0=menu, 1=historical training, 2=evaluation')
     parser.add_argument('--data', type=str, default='',
                         help='Path to historical data CSV file')
     parser.add_argument('--model', type=str, default='',
                         help='Path to trained model file')
     parser.add_argument('--episodes', type=int, default=50,
                         help='Number of episodes for training')
-    parser.add_argument('--duration', type=float, default=24,
-                        help='Duration for live trading in hours')
+    parser.add_argument('--window', type=int, default=20,
+                        help='Window size for observations')
+    parser.add_argument('--batch', type=int, default=64,
+                        help='Batch size for training')
+    parser.add_argument('--commission', type=float, default=0.0001,
+                        help='Commission fee (as decimal)')
+    parser.add_argument('--spread', type=float, default=0.0002,
+                        help='Bid-ask spread (as decimal)')
+    parser.add_argument('--slippage', type=float, default=0.0001,
+                        help='Base slippage (as decimal)')
 
     args = parser.parse_args()
 
     if args.mode == 0:
-        # Menu interactif
-        print("RL Trading Bot")
-        print("1. Train a new agent on live data")
-        print("2. Train a new agent on historical data")
-        print("3. Evaluate a trained model on historical data")
-        print("4. Start live trading with a trained agent")
+        # Interactive menu
+        print("RL Trading Bot with Realistic Parameters")
+        print("1. Train a new agent on historical data")
+        print("2. Evaluate a trained model on historical data")
 
-        choice = input("Enter your choice (1/2/3/4): ")
+        choice = input("Enter your choice (1/2): ")
 
         if choice == "1":
-            episodes = int(input("Enter number of episodes: "))
-            agent = train_agent(episodes=episodes)
-            print("Training completed!")
-
-        elif choice == "2":
             data_path = input("Enter path to historical data CSV: ")
             episodes = int(input("Enter number of episodes: "))
-            agent = train_on_historical_data(data_path, episodes=episodes)
-            print("Historical data training completed!")
+            window_size = int(input("Enter window size (default 20): ") or "20")
+            batch_size = int(input("Enter batch size (default 64): ") or "64")
+            commission = float(input("Enter commission fee (default 0.0001): ") or "0.0001")
+            spread = float(input("Enter bid-ask spread (default 0.0002): ") or "0.0002")
+            slippage = float(input("Enter base slippage (default 0.0001): ") or "0.0001")
 
-        elif choice == "3":
+            agent, run_name = train_on_historical_data(
+                data_path,
+                episodes=episodes,
+                batch_size=batch_size,
+                window_size=window_size,
+                commission_fee=commission,
+                bid_ask_spread=spread,
+                slippage_base=slippage
+            )
+            print("Historical data training completed!")
+            if run_name:
+                print(f"Results saved in logs/{run_name}/ and models/{run_name}/")
+
+        elif choice == "2":
             model_path = input("Enter path to the trained model: ")
             data_path = input("Enter path to test data CSV: ")
-            evaluate_model(model_path, data_path)
-            print("Evaluation completed!")
+            window_size = int(input("Enter window size (default 20): ") or "20")
+            commission = float(input("Enter commission fee (default 0.0001): ") or "0.0001")
+            spread = float(input("Enter bid-ask spread (default 0.0002): ") or "0.0002")
+            slippage = float(input("Enter base slippage (default 0.0001): ") or "0.0001")
 
-        elif choice == "4":
-            model_path = input("Enter the path to the trained model: ")
-            duration = float(input("Enter trading duration in hours: "))
-            live_trading(model_path, duration_hours=duration)
-            print("Trading completed!")
+            evaluate_model(
+                model_path,
+                data_path,
+                window_size=window_size,
+                commission_fee=commission,
+                bid_ask_spread=spread,
+                slippage_base=slippage
+            )
+            print("Evaluation completed!")
 
         else:
             print("Invalid choice!")
 
     else:
-        # Mode ligne de commande
+        # Command line mode
         if args.mode == 1:
-            print(f"Starting live training for {args.episodes} episodes", flush=True)
-            train_agent(episodes=args.episodes)
-
-        elif args.mode == 2:
             if not args.data:
                 print("Error: --data argument is required for historical training", flush=True)
             else:
                 print(f"Starting historical training on {args.data} for {args.episodes} episodes", flush=True)
-                train_on_historical_data(args.data, episodes=args.episodes)
+                train_on_historical_data(
+                    args.data,
+                    episodes=args.episodes,
+                    batch_size=args.batch,
+                    window_size=args.window,
+                    commission_fee=args.commission,
+                    bid_ask_spread=args.spread,
+                    slippage_base=args.slippage
+                )
 
-        elif args.mode == 3:
+        elif args.mode == 2:
             if not args.model or not args.data:
                 print("Error: --model and --data arguments are required for evaluation", flush=True)
             else:
                 print(f"Evaluating model {args.model} on {args.data}", flush=True)
-                evaluate_model(args.model, args.data)
-
-        elif args.mode == 4:
-            if not args.model:
-                print("Error: --model argument is required for live trading", flush=True)
-            else:
-                print(f"Starting live trading with model {args.model} for {args.duration} hours", flush=True)
-                live_trading(args.model, duration_hours=args.duration)
+                evaluate_model(
+                    args.model,
+                    args.data,
+                    window_size=args.window,
+                    commission_fee=args.commission,
+                    bid_ask_spread=args.spread,
+                    slippage_base=args.slippage
+                )

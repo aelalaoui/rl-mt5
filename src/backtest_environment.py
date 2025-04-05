@@ -1,15 +1,25 @@
-# src/backtest_environment.py (version modifiée)
+# src/backtest_environment.py (enhanced version)
 import numpy as np
 import pandas as pd
 from gym import spaces
 import time
+import random
+from datetime import datetime, time as dtime
 
 class BacktestTradingEnvironment:
-    def __init__(self, data_path, window_size=20):
-        # Charger les données historiques
+    def __init__(self, data_path, window_size=20,
+                 commission_fee=0.0001,  # 0.01% commission
+                 slippage_base=0.0001,   # 1 pip base slippage
+                 slippage_vol_impact=0.00005,  # additional slippage based on volume
+                 bid_ask_spread=0.0002,  # 2 pips spread
+                 market_impact_factor=0.0001,  # price impact of large orders
+                 liquidity_limit=0.05,   # max 5% of average volume
+                 latency_ms=(10, 50)):   # latency between 10-50ms
+
+        # Load historical data
         self.data = pd.read_csv(data_path)
 
-        # Vérifier si 'time' est une colonne ou un index
+        # Check if 'time' is a column or an index
         if 'time' in self.data.columns:
             self.data.set_index('time', inplace=True)
             try:
@@ -19,31 +29,102 @@ class BacktestTradingEnvironment:
 
         print(f"Data loaded with shape: {self.data.shape}")
 
-        self.window_size = window_size
+        # Calculate average trading volume
+        if 'volume' in self.data.columns:
+            self.avg_volume = self.data['volume'].mean()
+        else:
+            self.avg_volume = 10000  # default if no volume data
+            print("Warning: No volume data found, using default")
 
-        # Index actuel dans les données
+        # Trading parameters
+        self.window_size = window_size
+        self.commission_fee = commission_fee
+        self.slippage_base = slippage_base
+        self.slippage_vol_impact = slippage_vol_impact
+        self.bid_ask_spread = bid_ask_spread
+        self.market_impact_factor = market_impact_factor
+        self.liquidity_limit = liquidity_limit
+        self.latency_ms = latency_ms
+
+        # Current position in the data
         self.current_idx = window_size
         self.max_idx = len(self.data) - 1
         print(f"Starting at index {self.current_idx}, max index: {self.max_idx}")
 
-        # État du trading
-        self.position = 0  # 0: pas de position, 1: long, -1: short
+        # Trading state
+        self.position = 0  # 0: no position, 1: long, -1: short
         self.position_price = 0.0
         self.balance = 10000.0
         self.equity_curve = [self.balance]
+        self.trades = []
 
-        # Définir l'espace d'observation et d'action
+        # Define observation and action spaces
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(window_size*4+3,), dtype=np.float32)
-        self.action_space = spaces.Discrete(3)  # 0: ne rien faire, 1: acheter, 2: vendre
+        self.action_space = spaces.Discrete(3)  # 0: do nothing, 1: buy, 2: sell
 
-        # Préparer l'observation initiale
+        # Prepare initial observation
         self._update_observation()
 
+    def _is_market_open(self, timestamp):
+        """Check if the market is open based on timestamp"""
+        # For EUR/USD, the market is closed on weekends
+        # and has reduced activity during certain hours
+        if timestamp.weekday() >= 5:  # Saturday and Sunday
+            return False
+
+        # Check trading sessions (simplification)
+        # Note: EUR/USD trades 24/5, but activity/liquidity varies
+        t = timestamp.time()
+
+        # Low liquidity periods (simplified)
+        low_liquidity = (
+            (dtime(0, 0) <= t <= dtime(3, 0)) or  # Asian session wind-down
+            (dtime(21, 0) <= t <= dtime(23, 59))   # After US session
+        )
+
+        # Adjust spread and slippage during low liquidity
+        if low_liquidity:
+            self.current_spread = self.bid_ask_spread * 2
+            self.current_slippage_factor = 2.0
+        else:
+            self.current_spread = self.bid_ask_spread
+            self.current_slippage_factor = 1.0
+
+        return True
+
+    def _calculate_slippage(self, action, price, size=1.0):
+        """Calculate realistic slippage based on action, price, and market conditions"""
+        # Base slippage
+        slippage = self.slippage_base * self.current_slippage_factor
+
+        # Add volatility component
+        if hasattr(self, 'volatility'):
+            slippage += self.volatility * self.slippage_vol_impact
+
+        # Larger slippage for larger position sizes (market impact)
+        position_impact = size * self.market_impact_factor
+        slippage += position_impact
+
+        # Direction-based slippage (buy orders slip up, sell orders slip down)
+        if action == 1:  # buy
+            return slippage
+        elif action == 2:  # sell
+            return -slippage
+        return 0
+
+    def _get_bid_ask_prices(self):
+        """Get current bid and ask prices based on mid price and spread"""
+        mid_price = self.data.iloc[self.current_idx]['close']
+        half_spread = self.current_spread / 2
+        bid_price = mid_price - half_spread
+        ask_price = mid_price + half_spread
+        return bid_price, ask_price
+
     def _update_observation(self):
-        """Mettre à jour l'observation basée sur la fenêtre actuelle des données"""
+        """Update the observation based on the current data window"""
         print(f"Updating observation at index {self.current_idx}", flush=True)
 
-        # Extraire la fenêtre de données
+        # Extract the data window
         start_idx = max(0, self.current_idx-self.window_size)
         end_idx = self.current_idx
 
@@ -61,18 +142,24 @@ class BacktestTradingEnvironment:
             for _ in range(padding):
                 window_data = pd.concat([padding_data, window_data])
 
-        # Normaliser les prix par rapport au dernier prix de clôture
+        # Calculate volatility for slippage estimation
+        self.volatility = window_data['close'].pct_change().std()
+
+        # Update current bid/ask spread based on volatility
+        self.current_spread = self.bid_ask_spread * (1 + 5 * self.volatility)
+
+        # Normalize prices relative to last close price
         last_close = window_data.iloc[-1]['close']
 
-        # Créer des caractéristiques
+        # Create features
         opens = (window_data['open'].values / last_close) - 1.0
         highs = (window_data['high'].values / last_close) - 1.0
         lows = (window_data['low'].values / last_close) - 1.0
         closes = (window_data['close'].values / last_close) - 1.0
 
-        # Ajouter des indicateurs techniques simples
-        # RSI simplifié
-        rsi = 0.5  # Valeur par défaut
+        # Add simple technical indicators
+        # RSI
+        rsi = 0.5  # Default value
         try:
             delta = window_data['close'].diff()
             gain = delta.where(delta > 0, 0).rolling(window=14, min_periods=1).mean()
@@ -85,11 +172,11 @@ class BacktestTradingEnvironment:
             print(f"RSI calculation error: {e}", flush=True)
             rsi = 50
 
-        # Moyennes mobiles simplifiées
+        # Moving averages
         ma_5 = window_data['close'].rolling(5, min_periods=1).mean().iloc[-1]
         ma_20 = window_data['close'].rolling(20, min_periods=1).mean().iloc[-1]
 
-        # Créer l'observation
+        # Create observation
         observation = np.concatenate([
             opens[-self.window_size:],
             highs[-self.window_size:],
@@ -98,91 +185,162 @@ class BacktestTradingEnvironment:
             [self.position, rsi/100, (ma_5/last_close)-1]
         ])
 
-        # Remplacer les NaN par 0
+        # Replace NaN with 0
         observation = np.nan_to_num(observation)
 
         self.last_observation = observation
         return observation
 
     def reset(self):
-        """Réinitialiser l'environnement au début des données"""
+        """Reset the environment to the beginning of the data"""
         print("Resetting environment", flush=True)
         self.current_idx = self.window_size
         self.position = 0
         self.position_price = 0.0
         self.balance = 10000.0
         self.equity_curve = [self.balance]
+        self.trades = []
 
         return self._update_observation()
 
     def step(self, action):
-        """Exécuter une action et avancer dans les données"""
-        # Sauvegarder l'état actuel
-        current_price = self.data.iloc[self.current_idx]['close']
-        print(f"Step at idx {self.current_idx}, price: {current_price}, action: {action}", flush=True)
+        """Execute an action and advance in the data"""
+        # Save current state
+        timestamp = self.data.index[self.current_idx] if hasattr(self.data.index, 'to_pydatetime') else None
+        bid_price, ask_price = self._get_bid_ask_prices()
+        mid_price = self.data.iloc[self.current_idx]['close']
 
-        # Calculer le P&L si une position est ouverte
+        print(f"Step at idx {self.current_idx}, mid: {mid_price:.5f}, bid: {bid_price:.5f}, ask: {ask_price:.5f}, action: {action}", flush=True)
+
+        # Check if market is open (if timestamp is available)
+        market_open = True
+        if timestamp is not None:
+            market_open = self._is_market_open(timestamp)
+
+        # Calculate P&L if a position is open
         pnl = 0
         if self.position == 1:  # Long
-            pnl = (current_price - self.position_price) / self.position_price
+            pnl = (bid_price - self.position_price) / self.position_price
         elif self.position == -1:  # Short
-            pnl = (self.position_price - current_price) / self.position_price
+            pnl = (self.position_price - ask_price) / self.position_price
 
-        # Exécuter l'action
-        if action == 1 and self.position <= 0:  # Acheter
-            self.position = 1
-            self.position_price = current_price
-            print(f"  BUY at {current_price}", flush=True)
-        elif action == 2 and self.position >= 0:  # Vendre
-            self.position = -1
-            self.position_price = current_price
-            print(f"  SELL at {current_price}", flush=True)
+        # Execute action if market is open
+        trade_executed = False
+        slippage = 0
 
-        # Avancer à la prochaine barre
+        if market_open:
+            # Simulate network latency
+            latency = random.randint(self.latency_ms[0], self.latency_ms[1]) / 1000
+            time.sleep(latency)
+
+            # Calculate available liquidity (simplified)
+            available_liquidity = self.avg_volume * self.liquidity_limit
+
+            if action == 1 and self.position <= 0:  # Buy
+                # Calculate slippage
+                slippage = self._calculate_slippage(action, ask_price)
+                execution_price = ask_price * (1 + slippage)
+
+                # Apply commission
+                total_cost = execution_price * (1 + self.commission_fee)
+
+                self.position = 1
+                self.position_price = execution_price
+                trade_executed = True
+                print(f" BUY at {execution_price:.5f} (ask: {ask_price:.5f}, slippage: {slippage:.5f}%)", flush=True)
+
+                # Record trade
+                self.trades.append({
+                    'timestamp': timestamp,
+                    'action': 'buy',
+                    'price': execution_price,
+                    'slippage': slippage,
+                    'commission': self.commission_fee * execution_price
+                })
+
+            elif action == 2 and self.position >= 0:  # Sell
+                # Calculate slippage
+                slippage = self._calculate_slippage(action, bid_price)
+                execution_price = bid_price * (1 + slippage)
+
+                # Apply commission
+                total_cost = self.commission_fee * execution_price
+
+                self.position = -1
+                self.position_price = execution_price
+                trade_executed = True
+                print(f" SELL at {execution_price:.5f} (bid: {bid_price:.5f}, slippage: {slippage:.5f}%)", flush=True)
+
+                # Record trade
+                self.trades.append({
+                    'timestamp': timestamp,
+                    'action': 'sell',
+                    'price': execution_price,
+                    'slippage': slippage,
+                    'commission': total_cost
+                })
+
+        # Advance to next bar
         self.current_idx += 1
 
-        # Vérifier si nous avons atteint la fin des données
+        # Check if we've reached the end of the data
         done = self.current_idx >= len(self.data) - 1
 
         if done:
             print(f"End of data reached at index {self.current_idx}", flush=True)
-            # Fermer toutes les positions à la fin
+            # Close all positions at the end
             if self.position != 0:
-                final_price = self.data.iloc[-1]['close']
+                final_bid, final_ask = self._get_bid_ask_prices()
                 if self.position == 1:  # Long
+                    final_price = final_bid * (1 + self._calculate_slippage(2, final_bid))
                     pnl = (final_price - self.position_price) / self.position_price
                 else:  # Short
+                    final_price = final_ask * (1 + self._calculate_slippage(1, final_ask))
                     pnl = (self.position_price - final_price) / self.position_price
-                self.balance += self.balance * pnl
-                print(f"  Closing position at end with PnL: {pnl:.4f}", flush=True)
 
-        # Mettre à jour l'observation
+                # Subtract commission
+                pnl -= self.commission_fee
+
+                self.balance += self.balance * pnl
+                print(f" Closing position at end with PnL: {pnl:.4f}", flush=True)
+
+        # Update observation
         if not done:
             observation = self._update_observation()
         else:
             observation = self.last_observation
 
-        # Calculer la récompense
+        # Calculate reward
         if action == 0 and self.position == 0:
-            reward = -0.01  # Petite pénalité pour l'inactivité
+            reward = -0.01  # Small penalty for inactivity
         else:
-            reward = pnl * 100  # Convertir en points
+            # Reward includes slippage and commission costs for realism
+            if trade_executed:
+                transaction_cost = abs(slippage) + self.commission_fee
+                reward = -transaction_cost * 100  # Initial cost of trade as negative reward
+            else:
+                reward = pnl * 100  # Convert to points
 
-        # Mettre à jour le solde
+        # Update balance
         self.balance += self.balance * pnl
         self.equity_curve.append(self.balance)
 
-        print(f"  Reward: {reward:.4f}, Balance: {self.balance:.2f}, Done: {done}", flush=True)
+        print(f" Reward: {reward:.4f}, Balance: {self.balance:.2f}, Done: {done}", flush=True)
 
-        # Informations supplémentaires
+        # Additional information
         info = {
             'balance': self.balance,
             'position': self.position,
-            'pnl': pnl
+            'pnl': pnl,
+            'bid': bid_price,
+            'ask': ask_price,
+            'spread': ask_price - bid_price,
+            'slippage': slippage,
+            'market_open': market_open
         }
 
         return observation, reward, done, info
 
     def render(self):
-        """Afficher l'état actuel"""
+        """Display current state"""
         print(f"Balance: {self.balance:.2f}, Position: {self.position}")
