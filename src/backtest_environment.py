@@ -217,16 +217,21 @@ class BacktestTradingEnvironment:
         if timestamp is not None:
             market_open = self._is_market_open(timestamp)
 
-        # Calculate P&L if a position is open
-        pnl = 0
-        if self.position == 1:  # Long
-            pnl = (bid_price - self.position_price) / self.position_price
-        elif self.position == -1:  # Short
-            pnl = (self.position_price - ask_price) / self.position_price
+        # Fixed position size - 2% of account or maximum $1000
+        position_size = min(self.balance * 0.02, 1000.0)
+        
+        # Calculate current position value and P&L before taking new action
+        unrealized_pnl = 0
+        if self.position == 1:  # Long position
+            unrealized_pnl = position_size * (bid_price - self.position_price) / self.position_price
+        elif self.position == -1:  # Short position
+            unrealized_pnl = position_size * (self.position_price - ask_price) / self.position_price
 
         # Execute action if market is open
         trade_executed = False
         slippage = 0
+        commission = 0
+        reward = 0
 
         if market_open:
             # Simulate network latency
@@ -236,49 +241,113 @@ class BacktestTradingEnvironment:
             # Calculate available liquidity (simplified)
             available_liquidity = self.avg_volume * self.liquidity_limit
 
-            if action == 1 and self.position <= 0:  # Buy
-                # Calculate slippage
-                slippage = self._calculate_slippage(action, ask_price)
+            if action == 1 and self.position != 1:  # Buy (and not already long)
+                # Close any existing position
+                if self.position == -1:
+                    # Close short position
+                    close_slippage = self._calculate_slippage(1, ask_price)
+                    close_price = ask_price * (1 + close_slippage)
+                    close_commission = close_price * position_size * self.commission_fee
+                    
+                    # Realize profit/loss from closing position
+                    close_pnl = position_size * (self.position_price - close_price) / self.position_price
+                    self.balance += close_pnl - close_commission
+                
+                # Open new long position
+                slippage = self._calculate_slippage(1, ask_price)
                 execution_price = ask_price * (1 + slippage)
-
-                # Apply commission
-                total_cost = execution_price * (1 + self.commission_fee)
-
+                commission = execution_price * position_size * self.commission_fee
+                
+                # Update position
                 self.position = 1
                 self.position_price = execution_price
+                self.balance -= commission  # Deduct commission
+                
                 trade_executed = True
                 print(f" BUY at {execution_price:.5f} (ask: {ask_price:.5f}, slippage: {slippage:.5f}%)", flush=True)
-
+                
                 # Record trade
                 self.trades.append({
                     'timestamp': timestamp,
                     'action': 'buy',
                     'price': execution_price,
+                    'size': position_size,
                     'slippage': slippage,
-                    'commission': self.commission_fee * execution_price
+                    'commission': commission
                 })
+                
+                # Initial cost as negative reward
+                reward = -(slippage + self.commission_fee) * 100  # Convert to basis points
 
-            elif action == 2 and self.position >= 0:  # Sell
-                # Calculate slippage
-                slippage = self._calculate_slippage(action, bid_price)
+            elif action == 2 and self.position != -1:  # Sell (and not already short)
+                # Close any existing position
+                if self.position == 1:
+                    # Close long position
+                    close_slippage = self._calculate_slippage(2, bid_price)
+                    close_price = bid_price * (1 + close_slippage)
+                    close_commission = close_price * position_size * self.commission_fee
+                    
+                    # Realize profit/loss from closing position
+                    close_pnl = position_size * (close_price - self.position_price) / self.position_price
+                    self.balance += close_pnl - close_commission
+                
+                # Open new short position
+                slippage = self._calculate_slippage(2, bid_price)
                 execution_price = bid_price * (1 + slippage)
-
-                # Apply commission
-                total_cost = self.commission_fee * execution_price
-
+                commission = execution_price * position_size * self.commission_fee
+                
+                # Update position
                 self.position = -1
                 self.position_price = execution_price
+                self.balance -= commission  # Deduct commission
+                
                 trade_executed = True
                 print(f" SELL at {execution_price:.5f} (bid: {bid_price:.5f}, slippage: {slippage:.5f}%)", flush=True)
-
+                
                 # Record trade
                 self.trades.append({
                     'timestamp': timestamp,
                     'action': 'sell',
                     'price': execution_price,
+                    'size': position_size,
                     'slippage': slippage,
-                    'commission': total_cost
+                    'commission': commission
                 })
+                
+                # Initial cost as negative reward
+                reward = -(slippage + self.commission_fee) * 100  # Convert to basis points
+
+            elif action == 0 and self.position != 0:  # Close position
+                if self.position == 1:  # Close long
+                    close_slippage = self._calculate_slippage(2, bid_price)
+                    close_price = bid_price * (1 + close_slippage)
+                    close_commission = close_price * position_size * self.commission_fee
+                    
+                    # Realize profit/loss
+                    close_pnl = position_size * (close_price - self.position_price) / self.position_price
+                    self.balance += close_pnl - close_commission
+                    
+                    trade_executed = True
+                    print(f" CLOSE LONG at {close_price:.5f} (bid: {bid_price:.5f}, slippage: {close_slippage:.5f}%)", flush=True)
+                    
+                elif self.position == -1:  # Close short
+                    close_slippage = self._calculate_slippage(1, ask_price)
+                    close_price = ask_price * (1 + close_slippage)
+                    close_commission = close_price * position_size * self.commission_fee
+                    
+                    # Realize profit/loss
+                    close_pnl = position_size * (self.position_price - close_price) / self.position_price
+                    self.balance += close_pnl - close_commission
+                    
+                    trade_executed = True
+                    print(f" CLOSE SHORT at {close_price:.5f} (ask: {ask_price:.5f}, slippage: {close_slippage:.5f}%)", flush=True)
+                
+                # Reset position
+                self.position = 0
+                self.position_price = 0.0
+                
+                # Use actual P&L for reward when closing
+                reward = close_pnl / position_size * 100  # Convert to basis points
 
         # Advance to next bar
         self.current_idx += 1
@@ -293,16 +362,15 @@ class BacktestTradingEnvironment:
                 final_bid, final_ask = self._get_bid_ask_prices()
                 if self.position == 1:  # Long
                     final_price = final_bid * (1 + self._calculate_slippage(2, final_bid))
-                    pnl = (final_price - self.position_price) / self.position_price
+                    final_commission = final_price * position_size * self.commission_fee
+                    final_pnl = position_size * (final_price - self.position_price) / self.position_price
                 else:  # Short
                     final_price = final_ask * (1 + self._calculate_slippage(1, final_ask))
-                    pnl = (self.position_price - final_price) / self.position_price
+                    final_commission = final_price * position_size * self.commission_fee
+                    final_pnl = position_size * (self.position_price - final_price) / self.position_price
 
-                # Subtract commission
-                pnl -= self.commission_fee
-
-                self.balance += self.balance * pnl
-                print(f" Closing position at end with PnL: {pnl:.4f}", flush=True)
+                self.balance += final_pnl - final_commission
+                print(f" Closing position at end with PnL: {final_pnl:.4f}", flush=True)
 
         # Update observation
         if not done:
@@ -310,19 +378,15 @@ class BacktestTradingEnvironment:
         else:
             observation = self.last_observation
 
-        # Calculate reward
-        if action == 0 and self.position == 0:
-            reward = -0.01  # Small penalty for inactivity
-        else:
-            # Reward includes slippage and commission costs for realism
-            if trade_executed:
-                transaction_cost = abs(slippage) + self.commission_fee
-                reward = -transaction_cost * 100  # Initial cost of trade as negative reward
+        # Calculate reward if no trade was executed
+        if not trade_executed:
+            if self.position == 0:
+                reward = -0.01  # Small penalty for inactivity
             else:
-                reward = pnl * 100  # Convert to points
+                # Use unrealized P&L for reward
+                reward = unrealized_pnl / position_size * 100  # Convert to basis points
 
-        # Update balance
-        self.balance += self.balance * pnl
+        # Update equity curve
         self.equity_curve.append(self.balance)
 
         print(f" Reward: {reward:.4f}, Balance: {self.balance:.2f}, Done: {done}", flush=True)
@@ -331,11 +395,14 @@ class BacktestTradingEnvironment:
         info = {
             'balance': self.balance,
             'position': self.position,
-            'pnl': pnl,
+            'position_size': position_size if self.position != 0 else 0,
+            'position_price': self.position_price,
+            'unrealized_pnl': unrealized_pnl,
             'bid': bid_price,
             'ask': ask_price,
             'spread': ask_price - bid_price,
             'slippage': slippage,
+            'commission': commission,
             'market_open': market_open
         }
 
